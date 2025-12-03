@@ -1,0 +1,181 @@
+# Zaroori Libraries Ko Import Karein
+import os
+import logging
+import discord
+from discord.ext import commands
+from digitalocean import Manager, Droplet
+from dotenv import load_dotenv
+
+# --- Configuration & Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# .env file se keys load hongi
+load_dotenv()
+
+DISCORD_TOKEN = os.getenv("MTQ0MjM4OTE5MTMxNTk0NzYwNQ.Gepupb.6TuPBRN2V_X-OiWhbtdlkXJ7bS_WH21-K4whHo") 
+# Admin ID ko int mein convert karna zaroori hai
+ADMIN_USER_ID = int(os.getenv("DISCORD_ADMIN_ID", 0))
+
+DO_TOKEN = os.getenv("DIGITALOCEAN_API_TOKEN")
+
+# DigitalOcean Manager Initialize Karein
+try:
+    do_manager = Manager(token=DO_TOKEN)
+except Exception as e:
+    logger.error(f"DigitalOcean Manager initialization failed: {e}")
+    exit(1)
+
+# --- Discord Bot Setup ---
+# Bug Fix: Intents.message_content zaroori hai commands ke arguments padhne ke liye
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# --- Utility Functions (Bug Fix: is_admin function ab commands.check ke liye sahi hai) ---
+
+def is_admin():
+    """Custom check function ki command dene wala user admin hai ya nahi."""
+    async def predicate(ctx):
+        if ctx.author.id != ADMIN_USER_ID:
+            await ctx.send("🚫 Aap authorized admin nahi hain.")
+            logger.warning(f"Unauthorized access attempt by user ID: {ctx.author.id}")
+            return False
+        return True
+    return commands.check(predicate)
+
+# --- Discord Event Handler ---
+
+@bot.event
+async def on_ready():
+    """Jab bot Discord se successfully connect ho jaye."""
+    print('--------------------------------------------------')
+    print(f'🤖 Bot logged in as {bot.user.name} ({bot.user.id})')
+    print(f'🔑 Admin ID set to: {ADMIN_USER_ID}')
+    print('--------------------------------------------------')
+    logger.info("Discord Bot is ready.")
+
+# --- Discord Commands (Core Logic) ---
+
+@bot.command(name='help', help='Sare available commands dikhata hai.')
+@is_admin()
+async def help_command_discord(ctx):
+    """!help command."""
+    await ctx.send(
+        "📚 **VPS Deploy Bot - Commands:**\n"
+        "--- **Deployment** ---\n"
+        "1. `!create <name> <region> <size_slug> <owner>` - Naya VPS create karein.\n"
+        "2. `!delete <server_id>` - Server ko delete karein.\n"
+        "--- **Management** ---\n"
+        "3. `!list` - Saare active servers dekhein.\n"
+        "4. `!manage <server_id> <action>` - Server par action (e.g., reboot) karein.\n"
+        "5. `!ports <server_id> <port_number>` - Server firewall mein port add karein.\n"
+    )
+
+@bot.command(name='create', help='DigitalOcean Droplet create karta hai.')
+@is_admin()
+async def create_server_discord(ctx, name: str, region: str, size: str, owner: str):
+    """!create command."""
+    # Owner tag ko zyaada safe banane ke liye lower case mein kiya gaya hai
+    owner_tag = owner.lower()
+    image = 'ubuntu-22-04-x64' 
+    tags = [owner_tag, "bot-deployed", "discord-user"]
+
+    await ctx.send(
+        f"⏳ Deploying '{name}' (Size: {size}, Owner: {owner_tag}). Wait for confirmation..."
+    )
+
+    try:
+        droplet = Droplet(
+            token=DO_TOKEN,
+            name=name,
+            region=region,
+            size_slug=size,
+            image=image,
+            tags=tags,
+            # ssh_keys=[key_id] 
+        )
+        droplet.create()
+        logger.info(f"Deployment request sent for: {name} by {owner_tag}")
+
+        await ctx.send(
+            f"✅ Droplet **'{name}'** create hone ki request bhej di gayi hai. "
+            f"Tags: {', '.join(tags)}"
+        )
+
+    except Exception as e:
+        error_message = f"❌ Creation Failed! Error: {e}"
+        logger.error(error_message)
+        await ctx.send(error_message)
+
+
+@bot.command(name='list', help='Saare active Droplets ki list dikhata hai.')
+@is_admin()
+async def list_servers_discord(ctx):
+    """!list command."""
+    await ctx.send("⏳ Fetching active droplets...")
+    
+    try:
+        droplets = do_manager.get_all_droplets()
+        
+        if not droplets:
+            await ctx.send("No active droplets found.")
+            return
+
+        message = "🌐 **Active DigitalOcean Droplets:**\n"
+        for d in droplets:
+            # IP address ko safe tareeke se fetch karein
+            ip = d.ip_address if d.ip_address else "IP Pending/Unknown"
+            
+            # Message formatting ko zyaada clean kiya gaya hai
+            message += (
+                f"--- \n"
+                f"**Name:** `{d.name}`\n"
+                f"**ID:** `{d.id}`\n"
+                f"**Status:** `{d.status}`\n"
+                f"**IP:** `{ip}`\n"
+            )
+        
+        await ctx.send(message)
+
+    except Exception as e:
+        await ctx.send(f"❌ Droplets fetch nahi ho paye. Error: {e}")
+        logger.error(f"Error fetching droplets: {e}")
+
+
+@bot.command(name='manage', help='Server par action (reboot/power_off, etc.) karta hai.')
+@is_admin()
+async def manage_server_discord(ctx, server_id: str, action: str):
+    """!manage server_id action."""
+    
+    action = action.lower()
+    if action not in ['reboot', 'power_off', 'power_on', 'shutdown']:
+        await ctx.send("❌ Invalid action. Use: reboot, power_off, power_on, or shutdown.")
+        return
+
+    try:
+        # Bug Fix: server_id ko integer mein convert karne ki koshish karein
+        droplet_id = int(server_id)
+        droplet = do_manager.get_droplet(droplet_id)
+        
+        if not droplet:
+            await ctx.send(f"❌ Server ID `{server_id}` not found.")
+            return
+
+        if action == 'reboot':
+            droplet.reboot()
+        elif action == 'power_off':
+            droplet.power_off()
+        elif action == 'power_on':
+            droplet.power_on()
+        elif action == 'shutdown':
+            droplet.shutdown()
+        
+        await ctx.send(f"✅ Action **'{action}'** sent to server ID `{server_id}`.")
+        logger.info(f"Action {action} sent for server {server_id}")
+        
+    except ValueError:
+        await ctx.send(f"❌
